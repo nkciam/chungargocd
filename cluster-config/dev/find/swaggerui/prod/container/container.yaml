@@ -1,0 +1,124 @@
+---
+---
+# Source: container/templates/container-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: swaggerui
+    app.kubernetes.io/instance: swaggerui-prod
+  name: swaggerui-prod
+  namespace: default
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  selector:
+    app.kubernetes.io/name: swaggerui
+    app.kubernetes.io/instance: swaggerui-prod
+---
+
+# Source: container/templates/container-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swaggerui-prod
+  namespace: default
+  labels:
+    app.kubernetes.io/name: swaggerui
+    app.kubernetes.io/instance: swaggerui-prod
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: swaggerui
+      app.kubernetes.io/instance: swaggerui-prod
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: swaggerui
+        app.kubernetes.io/instance: swaggerui-prod
+    spec:
+      containers:
+      - name: swaggerui
+        image: episerver.azurecr.io/episerver/find-swaggerui:v3.23.11-develop-47609
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            cpu: "75m"
+            memory: "200Mi"
+          requests:
+            cpu: "50m"
+            memory: "150Mi"
+        env:
+        envFrom:
+        - secretRef:
+            name: cluster-secrets
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 60
+          timeoutSeconds: 2
+          periodSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: azure
+          mountPath: /mnt/azure
+      restartPolicy: Always
+      imagePullSecrets:
+      - name: acr-auth
+      volumes:
+      - name: azure
+        azureFile:
+          secretName: fileshare-secrets
+          shareName: optiq-logs-prod
+          readOnly: false
+status: {}
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-swaggerui-prod
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/swagger`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: strip-swaggerui-prod-prefix
+    services:
+    - name: swaggerui-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/swagger`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: strip-swaggerui-prod-prefix
+    services:
+    - name: swaggerui-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-swaggerui-prod-prefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /swagger
+

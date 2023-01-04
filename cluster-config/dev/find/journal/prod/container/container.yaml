@@ -1,0 +1,278 @@
+---
+---
+# Source: container/templates/container-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: journal
+    app.kubernetes.io/instance: journal-prod
+  name: journal-prod
+  namespace: default
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  selector:
+    app.kubernetes.io/name: journal
+    app.kubernetes.io/instance: journal-prod
+---
+
+# Source: container/templates/container-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: journal-prod
+  namespace: default
+  labels:
+    app.kubernetes.io/name: journal
+    app.kubernetes.io/instance: journal-prod
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: journal
+      app.kubernetes.io/instance: journal-prod
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: journal
+        app.kubernetes.io/instance: journal-prod
+    spec:
+      containers:
+      - name: journal
+        image: episerver.azurecr.io/episerver/find-services-journal:0.1-develop-47605
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            cpu: "200m"
+            memory: "1000Mi"
+          requests:
+            cpu: "150m"
+            memory: "800Mi"
+        env:
+        - name: ApplicationInsights__InstrumentationKey
+          value: "$(APPINSIGHTS_INSTRUMENTATION_KEY)"
+        - name: CentralLogging__Cluster
+          value: "$(CLUSTER_NAME)"
+        - name: CentralLogging__PathLog
+          value: "/mnt/azure"
+        - name: CentralLogging__Role
+          value: "journal"
+        - name: CentralLogging__Service
+          value: "optiq"
+        - name: CentralLogging__Source
+          value: "optiq-journal"
+        - name: CosmosDb__ConnectionString
+          value: "$(COSMOS_DB_CONNECTION_STRING)"
+        - name: DD_AGENT_HOST
+          value: "datadog-agent"
+        - name: DD_LOGS_INJECTION
+          value: "true"
+        - name: DD_RUNTIME_METRICS_ENABLED
+          value: "true"
+        - name: DD_SERVICE
+          value: "optiq"
+        - name: DD_SOURCE
+          value: "optiq-journal"
+        - name: DD_TRACE_AGENT_PORT
+          value: "8126"
+        - name: DD_TRACE_ANALYTICS_ENABLED
+          value: "true"
+        - name: DD_TRACE_ROUTE_TEMPLATE_RESOURCE_NAMES_ENABLED
+          value: "true"
+        - name: Logging__ApplicationInsights__LogLevel__Default
+          value: "warning"
+        - name: Logging__LogLevel__Default
+          value: "information"
+        envFrom:
+        - secretRef:
+            name: cluster-secrets
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 60
+          timeoutSeconds: 2
+          periodSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: azure
+          mountPath: /mnt/azure
+      restartPolicy: Always
+      imagePullSecrets:
+      - name: acr-auth
+      volumes:
+      - name: azure
+        azureFile:
+          secretName: fileshare-secrets
+          shareName: optiq-logs-prod
+          readOnly: false
+status: {}
+---
+
+# Source: container/templates/horizontal-autoscaler.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  labels:
+    app.kubernetes.io/name: journal
+    app.kubernetes.io/instance: journal-prod
+  name: journal-prod
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: journal-prod
+  minReplicas: 1
+  maxReplicas: 250
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-journal-prod
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/journal`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: journal-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/journal`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: journal-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-journal-prod-swagger
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/journal-api/swagger`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: strip-journal-prod-api-prefix
+    services:
+    - name: journal-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/journal-api/swagger`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: strip-journal-prod-api-prefix
+    services:
+    - name: journal-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-service-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-journal-prod-health
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/journal-service/health`) && Headers(`Ring`, `prod`)'
+    kind: Rule
+    middlewares:
+    - name: replace-journal-prod-service-health-path
+    services:
+    - name: journal-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/journal-service/health`)'
+    kind: Rule
+    middlewares:
+    - name: replace-journal-prod-service-health-path
+    services:
+    - name: journal-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-journal-prod-api-prefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /journal-api/
+---
+
+# Source: container/templates/container-service-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: replace-journal-prod-service-health-path
+  namespace: default
+spec:
+  replacePath:
+    path: /health
+

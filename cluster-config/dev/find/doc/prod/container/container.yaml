@@ -1,0 +1,331 @@
+---
+---
+# Source: container/templates/container-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app.kubernetes.io/name: doc
+    app.kubernetes.io/instance: doc-prod
+  name: doc-prod
+  namespace: default
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+  selector:
+    app.kubernetes.io/name: doc
+    app.kubernetes.io/instance: doc-prod
+---
+
+# Source: container/templates/container-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: doc-prod
+  namespace: default
+  labels:
+    app.kubernetes.io/name: doc
+    app.kubernetes.io/instance: doc-prod
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: doc
+      app.kubernetes.io/instance: doc-prod
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: doc
+        app.kubernetes.io/instance: doc-prod
+    spec:
+      containers:
+      - name: doc
+        image: episerver.azurecr.io/episerver/find-services-doc:0.2-develop-46865
+        ports:
+        - containerPort: 80
+        resources:
+          limits:
+            cpu: "1200m"
+            memory: "3.6Gi"
+          requests:
+            cpu: "800m"
+            memory: "3.2Gi"
+        env:
+        - name: ApplicationInsights__InstrumentationKey
+          value: "$(APPINSIGHTS_INSTRUMENTATION_KEY)"
+        - name: CentralLogging__Cluster
+          value: "$(CLUSTER_NAME)"
+        - name: CentralLogging__PathLog
+          value: "/mnt/azure"
+        - name: CentralLogging__Role
+          value: "doc"
+        - name: CentralLogging__Service
+          value: "optiq"
+        - name: CentralLogging__Source
+          value: "optiq-doc"
+        - name: DD_AGENT_HOST
+          value: "datadog-agent"
+        - name: DD_LOGS_INJECTION
+          value: "true"
+        - name: DD_RUNTIME_METRICS_ENABLED
+          value: "true"
+        - name: DD_SERVICE
+          value: "optiq"
+        - name: DD_SOURCE
+          value: "optiq-doc"
+        - name: DD_TRACE_AGENT_PORT
+          value: "8126"
+        - name: DD_TRACE_ANALYTICS_ENABLED
+          value: "true"
+        - name: DD_TRACE_ROUTE_TEMPLATE_RESOURCE_NAMES_ENABLED
+          value: "true"
+        - name: Elasticsearch__BaseAddress
+          value: "http://traefik-ingress-service-internal-elasticsearch/"
+        - name: EventHub__ConnectionString
+          value: "$(EVENTHUB_BULK_SENDER_CONNECTION_STRING__PROD)"
+        - name: Logging__LogLevel__Default
+          value: "warning"
+        - name: Proxy__UpstreamHost
+          value: "http://traefik-ingress-service-internal-elasticsearch/"
+        - name: StorageAccount__ConnectionString
+          value: "$(STORAGE_ACCOUNT_CONNECTION_STRING)"
+        envFrom:
+        - secretRef:
+            name: cluster-secrets
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 60
+          timeoutSeconds: 2
+          periodSeconds: 10
+          successThreshold: 1
+          failureThreshold: 3
+        volumeMounts:
+        - name: azure
+          mountPath: /mnt/azure
+      restartPolicy: Always
+      imagePullSecrets:
+      - name: acr-auth
+      volumes:
+      - name: azure
+        azureFile:
+          secretName: fileshare-secrets
+          shareName: optiq-logs-prod
+          readOnly: false
+status: {}
+---
+
+# Source: container/templates/horizontal-autoscaler.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  labels:
+    app.kubernetes.io/name: doc
+    app.kubernetes.io/instance: doc-prod
+  name: doc-prod
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: doc-prod
+  minReplicas: 1
+  maxReplicas: 250
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: External
+    external:
+      metric:
+        name: datadogmetric@default:doc-prod-requests-per-second
+      target:
+        type: Value
+        value: 15
+
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+---
+
+# Source: container/templates/horizontal-autoscaler.yaml
+apiVersion: datadoghq.com/v1alpha1
+kind: DatadogMetric
+metadata:
+  name: doc-prod-requests-per-second
+  namespace: default
+spec:
+  query: "max:traefik.service.request.tls.total{cluster_name:${CLUSTER_NAME},service:default-ingress-route-doc-prod*}.as_rate().rollup(max, 1)"
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-doc-prod
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/_doc`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/_doc`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/_meta`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/_meta`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/_stream`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/_stream`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: rate-limiter
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-doc-prod-swagger
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/doc-api/swagger`) && Headers(`Ring`, `prod`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: strip-doc-prod-api-prefix
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/doc-api/swagger`) && Headers(`X-Cluster-Secret`, `73c40afe533a0e07dc55f668aecad113a498f385115c247b356b1c0a1e0f04b5`)'
+    kind: Rule
+    middlewares:
+    - name: strip-doc-prod-api-prefix
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-service-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: ingress-route-doc-prod-health
+  namespace: default
+spec:
+  entryPoints:
+    - https
+    - internal-http
+  tls:
+    store: 
+      name: default
+  routes:
+  - match: 'PathPrefix(`/doc-service/health`) && Headers(`Ring`, `prod`)'
+    kind: Rule
+    middlewares:
+    - name: replace-doc-prod-service-health-path
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+  - match: 'PathPrefix(`/doc-service/health`)'
+    kind: Rule
+    middlewares:
+    - name: replace-doc-prod-service-health-path
+    services:
+    - name: doc-prod
+      port: 80
+      namespace: default
+---
+
+# Source: container/templates/container-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: strip-doc-prod-api-prefix
+  namespace: default
+spec:
+  stripPrefix:
+    prefixes:
+      - /doc-api/
+---
+
+# Source: container/templates/container-service-routing.yaml
+apiVersion: traefik.containo.us/v1alpha1
+kind: Middleware
+metadata:
+  name: replace-doc-prod-service-health-path
+  namespace: default
+spec:
+  replacePath:
+    path: /health
+
